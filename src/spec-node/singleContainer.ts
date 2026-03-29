@@ -405,9 +405,12 @@ while sleep 1 & wait $!; do :; done`, '-']; // `wait $!` allows for the `trap` t
 		cmd.push(...details.Config.Cmd || []);
 	}
 
+	const nameArg = params.containerName ? ['--name', params.containerName] : [];
+
 	const args = [
 		'run',
 		'--sig-proxy=false',
+		...nameArg,
 		'-a', 'STDOUT',
 		'-a', 'STDERR',
 		...exposed,

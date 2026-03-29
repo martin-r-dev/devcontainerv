@@ -74,6 +74,11 @@ export interface ProvisionOptions {
 	omitSyntaxDirective?: boolean;
 	includeConfig?: boolean;
 	includeMergedConfig?: boolean;
+	repositoryVolume?: {
+		volumeName: string;
+		repoBasename: string;
+	};
+	containerName?: string;
 }
 
 export async function launch(options: ProvisionOptions, providedIdLabels: string[] | undefined, disposables: (() => Promise<unknown> | undefined)[]) {
@@ -254,7 +259,9 @@ export async function createDockerParams(options: ProvisionOptions, disposables:
 		buildxOutput: common.buildxOutput,
 		buildxCacheTo: common.buildxCacheTo,
 		buildPlatformInfo,
-		targetPlatformInfo
+		targetPlatformInfo,
+		repositoryVolume: options.repositoryVolume,
+		containerName: options.containerName,
 	};
 }
 

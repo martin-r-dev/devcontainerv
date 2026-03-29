@@ -136,6 +136,11 @@ export interface DockerResolverParameters {
 	buildxCacheTo: string | undefined;
 	buildPlatformInfo: PlatformInfo;
 	targetPlatformInfo: PlatformInfo;
+	repositoryVolume?: {
+		volumeName: string;
+		repoBasename: string;
+	};
+	containerName?: string;
 }
 
 export interface ResolverResult {

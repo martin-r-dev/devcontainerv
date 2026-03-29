@@ -54,6 +54,13 @@ async function resolveWithLocalFolder(params: DockerResolverParameters, parsedAu
 			throw new ContainerError({ description: `No dev container config and no workspace found.` });
 		}
 	}
+	if (params.repositoryVolume) {
+		const { volumeName, repoBasename } = params.repositoryVolume;
+		const containerFolder = `/workspaces/${repoBasename}`;
+		configs.workspaceConfig.workspaceMount = `type=volume,source=${volumeName},target=${containerFolder}`;
+		configs.workspaceConfig.workspaceFolder = containerFolder;
+		configs.workspaceConfig.additionalMountString = undefined;
+	}
 	const idLabels = providedIdLabels || (await findContainerAndIdLabels(params, undefined, providedIdLabels, workspace?.rootFolderPath, configPath?.fsPath, params.removeOnStartup)).idLabels;
 	const configWithRaw = addSubstitution(configs.config, config => beforeContainerSubstitute(envListToObj(idLabels), config));
 	const { config } = configWithRaw;

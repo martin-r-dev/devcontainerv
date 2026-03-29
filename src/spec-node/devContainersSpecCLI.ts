@@ -45,6 +45,7 @@ import { featuresGenerateDocsHandler, featuresGenerateDocsOptions } from './feat
 import { templatesGenerateDocsHandler, templatesGenerateDocsOptions } from './templatesCLI/generateDocs';
 import { mapNodeOSToGOOS, mapNodeArchitectureToGOARCH } from '../spec-configuration/containerCollectionsOCI';
 import { templateMetadataHandler, templateMetadataOptions } from './templatesCLI/metadata';
+import { setupWorkspaceVolume, generateContainerName, cleanupOld } from './repoVolume';
 
 const defaultDefaultUserEnvProbe: UserEnvProbe = 'loginInteractiveShell';
 
@@ -90,6 +91,7 @@ const mountRegex = /^type=(bind|volume),source=([^,]+),target=([^,]+)(?:,externa
 		y.command('generate-docs', 'Generate documentation', templatesGenerateDocsOptions, templatesGenerateDocsHandler);
 	});
 	y.command(restArgs ? ['exec', '*'] : ['exec <cmd> [args..]'], 'Execute a command on a running dev container', execOptions, execHandler);
+	y.command('cleanup-old', 'Remove old workspace volumes and containers', cleanupOldOptions, cleanupOldHandler);
 	y.epilog(`devcontainer@${version} ${packageFolder}`);
 	y.parse(restArgs ? argv.slice(1) : argv);
 
@@ -143,14 +145,46 @@ function provisionOptions(y: Argv) {
 		'omit-syntax-directive': { type: 'boolean', default: false, hidden: true, description: 'Omit Dockerfile syntax directives' },
 		'include-configuration': { type: 'boolean', default: false, description: 'Include configuration in result.' },
 		'include-merged-configuration': { type: 'boolean', default: false, description: 'Include merged configuration in result.' },
+		'repository': { type: 'string', description: 'Repository URL to clone into a Docker volume (e.g., https://github.com/owner/repo.git or git@github.com:owner/repo.git). SSH URLs will use SSH agent forwarding.' },
+		'repository-ref': { type: 'string', description: 'Branch, tag, or commit hash to checkout when using --repository.' },
+		'gen-vol-prefix': { type: 'string', description: 'Generate workspace volume name: <prefix>-vol-YYMMDD-NN.' },
+		'vol-name': { type: 'string', description: 'Use an explicit workspace volume name.' },
+		'from-vol': { type: 'string', description: 'Clone an existing volume as build base (accepts <name>, <prefix>@latest, <prefix>@YYMMDD-NN, <prefix>@-N).' },
+		'with-vol': { type: 'string', description: 'Use an existing volume as workspace without cloning (accepts <name>, <prefix>@latest, <prefix>@YYMMDD-NN, <prefix>@-N).' },
+		'gen-ctr-prefix': { type: 'string', description: 'Generate container name: <prefix>-ctr-YYMMDD-NN.' },
+		'ctr-name': { type: 'string', description: 'Use an explicit container name.' },
 	})
 		.check(argv => {
 			const idLabels = (argv['id-label'] && (Array.isArray(argv['id-label']) ? argv['id-label'] : [argv['id-label']])) as string[] | undefined;
 			if (idLabels?.some(idLabel => !/.+=.+/.test(idLabel))) {
 				throw new Error('Unmatched argument format: id-label must match <name>=<value>');
 			}
-			// Default workspace-folder to current directory if not provided and no id-label or override-config
-			if (!argv['workspace-folder'] && !argv['id-label'] && !argv['override-config']) {
+			const hasVolumeSource = !!(argv['repository'] || argv['from-vol'] || argv['with-vol']);
+			if (hasVolumeSource && argv['workspace-folder']) {
+				throw new Error('Cannot combine --workspace-folder with --repository, --from-vol, or --with-vol.');
+			}
+			if (argv['from-vol'] && argv['with-vol']) {
+				throw new Error('Cannot specify both --from-vol and --with-vol.');
+			}
+			if (argv['from-vol'] && argv['repository']) {
+				throw new Error('Cannot specify both --from-vol and --repository.');
+			}
+			if (argv['with-vol'] && argv['repository']) {
+				throw new Error('Cannot specify both --with-vol and --repository.');
+			}
+			if (argv['with-vol'] && (argv['gen-vol-prefix'] || argv['vol-name'])) {
+				throw new Error('Cannot combine --with-vol with --gen-vol-prefix or --vol-name (volume already exists).');
+			}
+			if (argv['gen-vol-prefix'] && argv['vol-name']) {
+				throw new Error('Cannot specify both --gen-vol-prefix and --vol-name.');
+			}
+			if (argv['gen-ctr-prefix'] && argv['ctr-name']) {
+				throw new Error('Cannot specify both --gen-ctr-prefix and --ctr-name.');
+			}
+			if (argv['from-vol'] && !argv['gen-vol-prefix'] && !argv['vol-name']) {
+				throw new Error('--from-vol requires --gen-vol-prefix or --vol-name to name the cloned volume.');
+			}
+			if (!argv['workspace-folder'] && !argv['id-label'] && !argv['override-config'] && !hasVolumeSource) {
 				argv['workspace-folder'] = process.cwd();
 			}
 			const mounts = (argv.mount && (Array.isArray(argv.mount) ? argv.mount : [argv.mount])) as string[] | undefined;
@@ -216,13 +250,55 @@ async function provision({
 	'omit-syntax-directive': omitSyntaxDirective,
 	'include-configuration': includeConfig,
 	'include-merged-configuration': includeMergedConfig,
+	'repository': repository,
+	'repository-ref': repositoryRef,
+	'gen-vol-prefix': genVolPrefix,
+	'vol-name': volName,
+	'from-vol': fromVol,
+	'with-vol': withVol,
+	'gen-ctr-prefix': genCtrPrefix,
+	'ctr-name': ctrName,
 }: ProvisionArgs) {
 
-	const workspaceFolder = workspaceFolderArg ? path.resolve(process.cwd(), workspaceFolderArg) : undefined;
+	let workspaceFolder = workspaceFolderArg ? path.resolve(process.cwd(), workspaceFolderArg) : undefined;
 	const addRemoteEnvs = addRemoteEnv ? (Array.isArray(addRemoteEnv) ? addRemoteEnv as string[] : [addRemoteEnv]) : [];
 	const addCacheFroms = addCacheFrom ? (Array.isArray(addCacheFrom) ? addCacheFrom as string[] : [addCacheFrom]) : [];
 	const additionalFeatures = additionalFeaturesJson ? jsonc.parse(additionalFeaturesJson) as Record<string, string | boolean | Record<string, string | boolean>> : {};
-	const providedIdLabels = idLabel ? Array.isArray(idLabel) ? idLabel as string[] : [idLabel] : undefined;
+	let providedIdLabels = idLabel ? Array.isArray(idLabel) ? idLabel as string[] : [idLabel] : undefined;
+
+	let repositoryVolume: { volumeName: string; repoBasename: string } | undefined;
+	let containerName: string | undefined;
+	const hasVolumeSource = !!(repository || fromVol || withVol);
+	if (hasVolumeSource) {
+		const volResult = await setupWorkspaceVolume({
+			repository,
+			repositoryRef: repositoryRef,
+			genVolPrefix,
+			volName,
+			fromVol,
+			withVol,
+			dockerPath: dockerPath || 'docker',
+			logFormat,
+		});
+		workspaceFolder = volResult.tempDir;
+		repositoryVolume = { volumeName: volResult.volumeName, repoBasename: volResult.repoBasename };
+		if (!providedIdLabels) {
+			providedIdLabels = [`devcontainer.local_folder=${volResult.volumeName}`];
+		}
+	}
+
+	if (genCtrPrefix || ctrName) {
+		if (genCtrPrefix) {
+			const cliHost0 = await getCLIHost(process.cwd(), loadNativeModule, logFormat === 'text');
+			const silentLog = makeLog({ event() {} });
+			containerName = await generateContainerName(
+				{ exec: cliHost0.exec, cmd: dockerPath || 'docker', env: cliHost0.env, output: silentLog },
+				genCtrPrefix,
+			);
+		} else {
+			containerName = ctrName;
+		}
+	}
 
 	const cwd = workspaceFolder || process.cwd();
 	const cliHost = await getCLIHost(cwd, loadNativeModule, logFormat === 'text');
@@ -287,12 +363,21 @@ async function provision({
 		omitSyntaxDirective,
 		includeConfig,
 		includeMergedConfig,
+		repositoryVolume,
+		containerName,
 	};
 
 	const result = await doProvision(options, providedIdLabels);
+	const output: Record<string, unknown> = { ...result };
+	if (repositoryVolume) {
+		output.volumeName = repositoryVolume.volumeName;
+	}
+	if (containerName) {
+		output.containerName = containerName;
+	}
 	const exitCode = result.outcome === 'error' ? 1 : 0;
 	await new Promise<void>((resolve, reject) => {
-		process.stdout.write(JSON.stringify(result) + '\n', err => err ? reject(err) : resolve());
+		process.stdout.write(JSON.stringify(output) + '\n', err => err ? reject(err) : resolve());
 	});
 	if (result.outcome === 'success') {
 		await result.finishBackgroundTasks();
@@ -528,7 +613,28 @@ function buildOptions(y: Argv) {
 		'experimental-lockfile': { type: 'boolean', default: false, hidden: true, description: 'Write lockfile' },
 		'experimental-frozen-lockfile': { type: 'boolean', default: false, hidden: true, description: 'Ensure lockfile remains unchanged' },
 		'omit-syntax-directive': { type: 'boolean', default: false, hidden: true, description: 'Omit Dockerfile syntax directives' },
-	});
+		'repository': { type: 'string', description: 'Repository URL to clone into a Docker volume (e.g., https://github.com/owner/repo.git or git@github.com:owner/repo.git). SSH URLs will use SSH agent forwarding.' },
+		'repository-ref': { type: 'string', description: 'Branch, tag, or commit hash to checkout when using --repository.' },
+		'gen-vol-prefix': { type: 'string', description: 'Generate workspace volume name: <prefix>-vol-YYMMDD-NN.' },
+		'vol-name': { type: 'string', description: 'Use an explicit workspace volume name.' },
+		'from-vol': { type: 'string', description: 'Clone an existing volume as build base (accepts <name>, <prefix>@latest, <prefix>@YYMMDD-NN, <prefix>@-N).' },
+	})
+		.check(argv => {
+			const hasVolumeSource = !!(argv['repository'] || argv['from-vol']);
+			if (hasVolumeSource && argv['workspace-folder']) {
+				throw new Error('Cannot combine --workspace-folder with --repository or --from-vol.');
+			}
+			if (argv['from-vol'] && argv['repository']) {
+				throw new Error('Cannot specify both --from-vol and --repository.');
+			}
+			if (argv['gen-vol-prefix'] && argv['vol-name']) {
+				throw new Error('Cannot specify both --gen-vol-prefix and --vol-name.');
+			}
+			if (argv['from-vol'] && !argv['gen-vol-prefix'] && !argv['vol-name']) {
+				throw new Error('--from-vol requires --gen-vol-prefix or --vol-name to name the cloned volume.');
+			}
+			return true;
+		});
 }
 
 type BuildArgs = UnpackArgv<ReturnType<typeof buildOptions>>;
@@ -570,13 +676,35 @@ async function doBuild({
 	'experimental-lockfile': experimentalLockfile,
 	'experimental-frozen-lockfile': experimentalFrozenLockfile,
 	'omit-syntax-directive': omitSyntaxDirective,
+	'repository': repository,
+	'repository-ref': repositoryRef,
+	'gen-vol-prefix': genVolPrefix,
+	'vol-name': volName,
+	'from-vol': fromVol,
 }: BuildArgs) {
 	const disposables: (() => Promise<unknown> | undefined)[] = [];
 	const dispose = async () => {
 		await Promise.all(disposables.map(d => d()));
 	};
 	try {
-		const workspaceFolder = workspaceFolderArg ? path.resolve(process.cwd(), workspaceFolderArg) : process.cwd();
+		let workspaceFolder = workspaceFolderArg ? path.resolve(process.cwd(), workspaceFolderArg) : process.cwd();
+		let repositoryVolumeResult: { volumeName: string; repoBasename: string } | undefined;
+
+		const hasVolumeSource = !!(repository || fromVol);
+		if (hasVolumeSource) {
+			const volResult = await setupWorkspaceVolume({
+				repository,
+				repositoryRef: repositoryRef,
+				genVolPrefix,
+				volName,
+				fromVol,
+				dockerPath: dockerPath || 'docker',
+				logFormat,
+			});
+			workspaceFolder = volResult.tempDir;
+			repositoryVolumeResult = { volumeName: volResult.volumeName, repoBasename: volResult.repoBasename };
+		}
+
 		const configFile: URI | undefined = configParam ? URI.file(path.resolve(process.cwd(), configParam)) : undefined;
 		const overrideConfigFile: URI | undefined = /* overrideConfig ? URI.file(path.resolve(process.cwd(), overrideConfig)) : */ undefined;
 		const addCacheFroms = addCacheFrom ? (Array.isArray(addCacheFrom) ? addCacheFrom as string[] : [addCacheFrom]) : [];
@@ -728,6 +856,7 @@ async function doBuild({
 		return {
 			outcome: 'success' as 'success',
 			imageName: imageNameResult,
+			...(repositoryVolumeResult ? { volumeName: repositoryVolumeResult.volumeName } : {}),
 			dispose,
 		};
 	} catch (originalError) {
@@ -1413,6 +1542,48 @@ function createStdoutResizeEmitter(disposables: (() => Promise<unknown> | void)[
 	});
 	disposables.push(() => emitter.dispose());
 	return emitter.event;
+}
+
+function cleanupOldOptions(y: Argv) {
+	return y.options({
+		'docker-path': { type: 'string', description: 'Docker CLI path.' },
+		'log-format': { choices: ['text' as 'text', 'json' as 'json'], default: 'text' as 'text', description: 'Log format.' },
+		'vol-prefix': { type: 'string', description: 'Volume prefix to clean up. Format: <prefix>@-N to keep the most recent N volumes.' },
+		'ctr-prefix': { type: 'string', description: 'Container prefix to clean up. Format: <prefix>@-N to keep the most recent N containers.' },
+		'dry-run': { type: 'boolean', default: false, description: 'Show what would be removed without actually removing.' },
+	})
+		.check(argv => {
+			if (!argv['vol-prefix'] && !argv['ctr-prefix']) {
+				throw new Error('At least one of --vol-prefix or --ctr-prefix is required.');
+			}
+			return true;
+		});
+}
+
+type CleanupOldArgs = UnpackArgv<ReturnType<typeof cleanupOldOptions>>;
+
+function cleanupOldHandler(args: CleanupOldArgs) {
+	runAsyncHandler(doCleanupOld.bind(null, args));
+}
+
+async function doCleanupOld({
+	'docker-path': dockerPath,
+	'log-format': logFormat,
+	'vol-prefix': volRef,
+	'ctr-prefix': ctrRef,
+	'dry-run': dryRun,
+}: CleanupOldArgs) {
+	const result = await cleanupOld({
+		volRef,
+		ctrRef,
+		dockerPath: dockerPath || 'docker',
+		logFormat,
+		dryRun,
+	});
+	await new Promise<void>((resolve, reject) => {
+		process.stdout.write(JSON.stringify(result) + '\n', err => err ? reject(err) : resolve());
+	});
+	process.exit(result.errors.length > 0 ? 1 : 0);
 }
 
 async function readSecretsFromFile(params: { output?: Log; secretsFile?: string; cliHost: CLIHost }) {

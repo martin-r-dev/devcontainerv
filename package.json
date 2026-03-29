@@ -1,17 +1,17 @@
 {
-	"name": "@devcontainers/cli",
-	"description": "Dev Containers CLI",
+	"name": "devcontainerv",
+	"description": "Dev Containers CLI (extended with workspace volume management)",
 	"version": "0.84.1",
 	"bin": {
-		"devcontainer": "devcontainer.js"
+		"devcontainerv": "devcontainer.js"
 	},
-	"author": "Microsoft Corporation",
+	"author": "martin-r-dev",
 	"repository": {
 		"type": "git",
-		"url": "https://github.com/devcontainers/cli.git"
+		"url": "https://github.com/martin-r-dev/devcontainerv.git"
 	},
 	"bugs": {
-		"url": "https://github.com/devcontainers/cli/issues"
+		"url": "https://github.com/martin-r-dev/devcontainerv/issues"
 	},
 	"license": "MIT",
 	"engines": {
